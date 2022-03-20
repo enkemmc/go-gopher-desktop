@@ -12,28 +12,30 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/data/binding"
+	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/widget"
 )
 
-func main() {
+const APP_NAME = "Notification App"
 
-	window, data := configureApp()
+func main() {
+	window, state := configureApp()
 	subscribeToServer()
-	go listenForUpdates(&data)
-	// go startPollLoop(&data)
+	go listenForUpdates(state)
 	window.ShowAndRun()
 }
 
-var MYADDR = "127.0.0.1:9090"
-var SERVERADDR = "http://127.0.0.1:8080"
+//var MYADDR = "127.0.0.1:9090"
+//var SERVERADDR = "http://127.0.0.1:8080"
+var SERVERADDR = "http://localhost:8080"
+var MYADDR = "172.23.128.1:9090"
 
 func subscribeToServer() {
 	postBody, _ := json.Marshal(map[string]string{
 		"myaddress": MYADDR,
 	})
 	responseBody := bytes.NewBuffer(postBody)
-	fmt.Printf("posting to %s\n", SERVERADDR)
+	fmt.Printf("connecting to %s\n", SERVERADDR)
 	resp, err := http.Post(SERVERADDR, "application/json", responseBody)
 	if err != nil {
 		log.Fatal(err)
@@ -46,11 +48,14 @@ func subscribeToServer() {
 	}
 }
 
-func listenForUpdates(data *binding.StringList) {
+func listenForUpdates(state *AppState) {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "POST" {
 			// storeIP(w, r, state)
-			readAndUpdate(r, data)
+			readAndUpdate(r, state)
+			w.WriteHeader(200)
+		} else if r.Method == "GET" {
+			fmt.Println("received a get!")
 			w.WriteHeader(200)
 		} else {
 			w.WriteHeader(404)
@@ -61,7 +66,7 @@ func listenForUpdates(data *binding.StringList) {
 	http.ListenAndServe(":9090", nil)
 }
 
-func readAndUpdate(r *http.Request, data *binding.StringList) {
+func readAndUpdate(r *http.Request, state *AppState) {
 	body, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		log.Fatal(err)
@@ -73,95 +78,100 @@ func readAndUpdate(r *http.Request, data *binding.StringList) {
 		log.Fatal(err)
 	}
 
-	newUrls := []string{}
-	for _, urlString := range urls {
-		found := false
-	inner:
-		for i := 0; i < (*data).Length(); i++ {
-			value, _ := (*data).GetValue(i)
-			if value == urlString {
-				found = true
-				break inner
-			}
-		}
+	changeFound := false
 
-		if !found {
-			newUrls = append(newUrls, urlString)
+	for _, urlString := range urls {
+		if _, exists := (*state).SeenUrls[urlString]; !exists {
+			state.SeenUrls[urlString] = false
+			changeFound = true
 		}
 	}
 
-	for _, urlString := range newUrls {
-		err := (*data).Append(urlString)
-		if err != nil {
-			log.Fatal(err)
-		}
+	if changeFound {
+		state.EmitNotification("new post found", "")
+		state.UpdateVisibleUrls()
 	}
 }
 
-func configureApp() (fyne.Window, binding.StringList) {
-	a := app.New()
-	w := a.NewWindow("Hello")
+type AppState struct {
+	SeenUrls        map[string]bool
+	VisibleUrls     []string
+	notifyCallback  func(string, string)
+	refreshCallback func()
+}
 
-	boundList := binding.NewStringList()
-	list := widget.NewListWithData(
-		boundList,
+func (s *AppState) UpdateVisibleUrls() {
+	keys := []string{}
+	for url, seen := range s.SeenUrls {
+		if !seen {
+			keys = append(keys, url)
+		}
+	}
+	s.VisibleUrls = keys
+	s.refreshCallback()
+}
+
+func (s *AppState) EmitNotification(title string, body string) {
+	s.notifyCallback(title, body)
+}
+
+func (s *AppState) SetRefreshCallback(cb func()) {
+	s.refreshCallback = cb
+}
+
+func (s *AppState) SetNotifyCallback(cb func(string, string)) {
+	s.notifyCallback = cb
+}
+
+func configureApp() (fyne.Window, *AppState) {
+	a := app.New()
+	w := a.NewWindow(APP_NAME)
+
+	state := AppState{
+		SeenUrls:    make(map[string]bool),
+		VisibleUrls: make([]string, 0, 0),
+	}
+
+	var list *widget.List
+	list = widget.NewList(func() int {
+		return len(state.VisibleUrls)
+	},
 		func() fyne.CanvasObject {
-			button := widget.NewButton("template", nil)
-			button.OnTapped = func() {
-				u, e := url.ParseRequestURI(button.Text)
+			label := widget.NewLabel("default label")
+			open_button := widget.NewButton("Open", nil)
+			clear_button := widget.NewButton("Clear", nil)
+			group := container.New(layout.NewHBoxLayout(), label, open_button, clear_button)
+
+			open_button.OnTapped = func() {
+				u, e := url.ParseRequestURI(label.Text)
 				if e == nil {
-					fmt.Println("trying to open url")
 					e = a.OpenURL(u)
 					if e != nil {
 						fmt.Printf("error opening url: %s", e.Error())
 					}
 				}
-				button.Hide()
 			}
-			return button
+
+			clear_button.OnTapped = func() {
+				state.SeenUrls[label.Text] = true
+				state.UpdateVisibleUrls()
+			}
+
+			return group
 		},
-		func(i binding.DataItem, o fyne.CanvasObject) {
-			str, _ := i.(binding.String).Get()
-			o.(*widget.Button).SetText(str)
+		func(itemId int, o fyne.CanvasObject) {
+			labelObj := o.(*fyne.Container).Objects[0]
+			labelText := state.VisibleUrls[itemId]
+			labelObj.(*widget.Label).SetText(labelText)
 		},
 	)
 
+	state.SetNotifyCallback(func(s1, s2 string) {
+		a.SendNotification(fyne.NewNotification(s1, s2))
+	})
+	state.SetRefreshCallback(list.Refresh)
+
 	w.SetContent(container.NewBorder(nil, nil, nil, nil, list))
 
-	return w, boundList
+	return w, &state
 }
-
-// func startApp(data *[]string) {
-// 	a := app.New()
-// 	w := a.NewWindow("My App")
-
-// 	boundList := binding.BindStringList(data)
-
-// 	list := widget.NewListWithData(boundList, createItemm, updateItemm)
-
-// 	lenLabel := widget.NewLabel("1")
-// 	lenButton := widget.NewButton("update", func() {
-// 		boundList.Reload()
-// 		labelStr := fmt.Sprint(len(*data))
-// 		fmt.Printf("updating label to %s\n", labelStr)
-// 		lenLabel.SetText(labelStr)
-// 	})
-
-// 	// w.SetContent(container.NewVBox(
-// 	// 	lenLabel,
-// 	// 	lenButton,
-// 	// 	list,
-// 	// ))
-// 	w.SetContent(container.NewBorder(nil, nil, nil, nil, list, lenLabel, lenButton))
-
-// 	w.ShowAndRun()
-// }
-
-// func createItemm() fyne.CanvasObject {
-// 	label := widget.NewLabel("template")
-// 	return label
-// }
-
-// func updateItemm(i binding.DataItem, o fyne.CanvasObject) {
-// 	o.(*widget.Label).Bind(i.(binding.String))
-// }
